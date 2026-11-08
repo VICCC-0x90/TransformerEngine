@@ -834,8 +834,15 @@ def test_gpt_full_activation_recompute(
 
 @pytest.mark.parametrize("use_reentrant", all_boolean)
 @pytest.mark.parametrize("graph_safe", all_boolean)
-@pytest.mark.parametrize("tracked_dropout", all_boolean)
-def test_checkpoint_rng_replay(use_reentrant, graph_safe, tracked_dropout, monkeypatch):
+@pytest.mark.parametrize(
+    "tracker_streams,tracked_dropout",
+    [(None, False), (0, False), (1, False), (1, True), (3, True)],
+    ids=["no_tracker", "empty_tracker", "default_rng", "tracked_rng", "multiple_streams"],
+)
+@pytest.mark.parametrize("nested", all_boolean)
+def test_checkpoint_rng_replay(
+    use_reentrant, graph_safe, tracker_streams, tracked_dropout, nested, monkeypatch
+):
     """Checkpoint recomputation must preserve both dropout masks and RNG progression."""
     if graph_safe and not te_distributed.graph_safe_rng_available():
         pytest.skip("Graph-safe RNG APIs are unavailable")
@@ -846,37 +853,48 @@ def test_checkpoint_rng_replay(use_reentrant, graph_safe, tracked_dropout, monke
     def run(checkpointed):
         torch.manual_seed(1234)
         tracker = te_distributed.CudaRNGStatesTracker()
-        tracker.add("model-parallel-rng", 4321)
-        original_generator = tracker.get_states()["model-parallel-rng"]
+        for index in range(tracker_streams or 0):
+            tracker.add(f"stream-{index}", 4321 + index)
+        original_states = tracker.get_states()
+        get_tracker = (lambda: tracker) if tracker_streams is not None else None
         results = []
 
         def block(value):
-            context = tracker.fork() if tracked_dropout else nullcontext()
-            with context:
-                return torch.nn.functional.dropout(value, p=0.5, training=True)
+            if tracked_dropout:
+                for name in original_states:
+                    with tracker.fork(name):
+                        value = torch.nn.functional.dropout(value, p=0.5, training=True)
+                return value
+            return torch.nn.functional.dropout(value, p=0.5, training=True)
+
+        def checkpoint(function, value):
+            return te_checkpoint(
+                function,
+                value,
+                use_reentrant=use_reentrant,
+                get_rng_state_tracker=get_tracker,
+            )
+
+        def outer(value):
+            return checkpoint(block, value) if nested and checkpointed else block(value)
 
         for _ in range(2):
             inp = torch.ones(4096, device="cuda", requires_grad=True)
             if checkpointed:
-                out = te_checkpoint(
-                    block,
-                    inp,
-                    use_reentrant=use_reentrant,
-                    get_rng_state_tracker=lambda: tracker,
-                )
+                out = checkpoint(outer, inp)
             else:
-                out = block(inp)
+                out = outer(inp)
             out.sum().backward()
             results.extend((out.detach(), inp.grad.detach()))
             torch.testing.assert_close(inp.grad, out.detach(), rtol=0, atol=0)
 
         results.append(torch.cuda.get_rng_state())
-        tracked_state = tracker.get_states()["model-parallel-rng"]
-        if graph_safe:
-            torch.testing.assert_close(
-                original_generator.get_state(), tracked_state.get_state(), rtol=0, atol=0
-            )
-        results.append(tracked_state.get_state() if graph_safe else tracked_state)
+        for name, tracked_state in tracker.get_states().items():
+            if graph_safe:
+                torch.testing.assert_close(
+                    original_states[name].get_state(), tracked_state.get_state(), rtol=0, atol=0
+                )
+            results.append(tracked_state.get_state() if graph_safe else tracked_state)
         return results
 
     with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
