@@ -44,6 +44,7 @@ from transformer_engine.pytorch import (
     is_nvfp4_available,
 )
 from transformer_engine.pytorch import checkpoint as te_checkpoint
+import transformer_engine.pytorch.distributed as te_distributed
 from transformer_engine.pytorch.distributed import (
     is_fp8_activation_recompute_enabled,
     in_fp8_activation_recompute_phase,
@@ -829,6 +830,60 @@ def test_gpt_full_activation_recompute(
             msg=f"Mismatch in tensor {i}",
             **tols,
         )
+
+
+@pytest.mark.parametrize("use_reentrant", all_boolean)
+@pytest.mark.parametrize("graph_safe", all_boolean)
+@pytest.mark.parametrize("tracked_dropout", all_boolean)
+def test_checkpoint_rng_replay(use_reentrant, graph_safe, tracked_dropout, monkeypatch):
+    """Checkpoint recomputation must preserve both dropout masks and RNG progression."""
+    if graph_safe and not te_distributed.graph_safe_rng_available():
+        pytest.skip("Graph-safe RNG APIs are unavailable")
+    if not graph_safe:
+        monkeypatch.setattr(te_distributed, "graph_safe_rng_available", lambda: False)
+    monkeypatch.setattr(te_distributed, "_ALL_ACTIVE_RNG_STATES", {})
+
+    def run(checkpointed):
+        torch.manual_seed(1234)
+        tracker = te_distributed.CudaRNGStatesTracker()
+        tracker.add("model-parallel-rng", 4321)
+        original_generator = tracker.get_states()["model-parallel-rng"]
+        results = []
+
+        def block(value):
+            context = tracker.fork() if tracked_dropout else nullcontext()
+            with context:
+                return torch.nn.functional.dropout(value, p=0.5, training=True)
+
+        for _ in range(2):
+            inp = torch.ones(4096, device="cuda", requires_grad=True)
+            if checkpointed:
+                out = te_checkpoint(
+                    block,
+                    inp,
+                    use_reentrant=use_reentrant,
+                    get_rng_state_tracker=lambda: tracker,
+                )
+            else:
+                out = block(inp)
+            out.sum().backward()
+            results.extend((out.detach(), inp.grad.detach()))
+            torch.testing.assert_close(inp.grad, out.detach(), rtol=0, atol=0)
+
+        results.append(torch.cuda.get_rng_state())
+        tracked_state = tracker.get_states()["model-parallel-rng"]
+        if graph_safe:
+            torch.testing.assert_close(
+                original_generator.get_state(), tracked_state.get_state(), rtol=0, atol=0
+            )
+        results.append(tracked_state.get_state() if graph_safe else tracked_state)
+        return results
+
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        reference = run(False)
+        checkpointed = run(True)
+    for actual, expected in zip(checkpointed, reference):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)

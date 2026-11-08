@@ -328,6 +328,42 @@ def _get_active_autocast_contexts():
     return gpu_autocast_ctx, cpu_autocast_ctx
 
 
+class _CheckpointRNGState:
+    """RNG state saved at a checkpoint boundary."""
+
+    # pylint: disable=too-few-public-methods
+
+    def __init__(self, get_rng_state_tracker: Optional[Callable]):
+        self.get_rng_state_tracker = get_rng_state_tracker
+        self.cpu_state = torch.get_rng_state()
+        self.tracker_states = (
+            get_rng_state_tracker().get_states() if get_rng_state_tracker is not None else None
+        )
+        self.graph_safe = (
+            is_graph_safe_rng_state(next(iter(self.tracker_states.values())))
+            if self.tracker_states
+            else False
+        )
+        self.cuda_state = _get_cuda_rng_state(graph_safe=self.graph_safe)
+        self.generator_snapshots = []
+        if self.graph_safe and not torch.cuda.is_current_stream_capturing():
+            # Keep the original generators for CUDA graph registration, but save
+            # independent values so eager RNG consumption cannot change the snapshot.
+            generators = [self.cuda_state, *self.tracker_states.values()]
+            self.generator_snapshots = [
+                (generator, generator.get_state()) for generator in generators
+            ]
+
+    def restore(self):
+        """Restore saved values without replacing graph-registered generator states."""
+        torch.set_rng_state(self.cpu_state)
+        for generator, state in self.generator_snapshots:
+            generator.set_state(state)
+        _set_cuda_rng_state(self.cuda_state, graph_safe=self.graph_safe)
+        if self.get_rng_state_tracker is not None:
+            self.get_rng_state_tracker().set_states(self.tracker_states)
+
+
 class _CheckpointFunction(torch.autograd.Function):
     """This function is adapted from torch.utils.checkpoint with
     two main changes:
@@ -352,18 +388,7 @@ class _CheckpointFunction(torch.autograd.Function):
         ctx.run_function = run_function
         ctx.distribute_saved_activations = distribute_saved_activations
 
-        # Copy the rng states.
-        ctx.fwd_cpu_rng_state = torch.get_rng_state()
-        if get_rng_state_tracker is not None:
-            ctx.fwd_cuda_rng_state_tracker = get_rng_state_tracker().get_states()
-            ctx.graph_safe_rng_state = (
-                is_graph_safe_rng_state(next(iter(ctx.fwd_cuda_rng_state_tracker.values())))
-                if ctx.fwd_cuda_rng_state_tracker
-                else False
-            )
-        else:
-            ctx.graph_safe_rng_state = False
-        ctx.fwd_cuda_rng_state = _get_cuda_rng_state(graph_safe=ctx.graph_safe_rng_state)
+        ctx.fwd_rng_state = _CheckpointRNGState(get_rng_state_tracker)
 
         if context_fn is not None:
             forward_ctx, recompute_ctx = context_fn()
@@ -430,17 +455,8 @@ class _CheckpointFunction(torch.autograd.Function):
                 gather_split_1d_tensor(inputs[0].data, ctx.tp_group).view(ctx.input_0_shape),
             )
 
-        # Store the current states.
-        bwd_cpu_rng_state = torch.get_rng_state()
-        bwd_cuda_rng_state = _get_cuda_rng_state(graph_safe=ctx.graph_safe_rng_state)
-        if get_rng_state_tracker is not None:
-            bwd_cuda_rng_state_tracker = get_rng_state_tracker().get_states()
-
-        # Set the states to what it used to be before the forward pass.
-        torch.set_rng_state(ctx.fwd_cpu_rng_state)
-        _set_cuda_rng_state(ctx.fwd_cuda_rng_state, graph_safe=ctx.graph_safe_rng_state)
-        if get_rng_state_tracker is not None:
-            get_rng_state_tracker().set_states(ctx.fwd_cuda_rng_state_tracker)
+        bwd_rng_state = _CheckpointRNGState(get_rng_state_tracker)
+        ctx.fwd_rng_state.restore()
 
         # Compute the forward pass.
         detached_inputs = detach_variable(inputs)
@@ -451,11 +467,7 @@ class _CheckpointFunction(torch.autograd.Function):
         ):
             outputs = ctx.run_function(*detached_inputs, **ctx.kwargs)
 
-        # Set the states back to what it was at the start of this function.
-        torch.set_rng_state(bwd_cpu_rng_state)
-        _set_cuda_rng_state(bwd_cuda_rng_state, graph_safe=ctx.graph_safe_rng_state)
-        if get_rng_state_tracker is not None:
-            get_rng_state_tracker().set_states(bwd_cuda_rng_state_tracker)
+        bwd_rng_state.restore()
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
@@ -496,21 +508,7 @@ class _CheckpointFrame:
 
     def cache_rng_states(self, forward=True):
         """Cache fwd/bwd RNG states in the frame to restore later."""
-        rng_states = (torch.get_rng_state(),)
-        if self.get_rng_state_tracker is not None:
-            tracker_states = self.get_rng_state_tracker().get_states()
-            self.graph_safe_rng_state = (
-                is_graph_safe_rng_state(next(iter(tracker_states.values())))
-                if tracker_states
-                else False
-            )
-            rng_states += (
-                _get_cuda_rng_state(graph_safe=self.graph_safe_rng_state),
-                tracker_states,
-            )
-        else:
-            self.graph_safe_rng_state = False
-            rng_states += (_get_cuda_rng_state(graph_safe=self.graph_safe_rng_state),)
+        rng_states = _CheckpointRNGState(self.get_rng_state_tracker)
 
         if forward:
             self.fwd_rng_states = rng_states
@@ -524,10 +522,7 @@ class _CheckpointFrame:
         else:
             rng_states = self.bwd_rng_states
 
-        torch.set_rng_state(rng_states[0])
-        _set_cuda_rng_state(rng_states[1], graph_safe=self.graph_safe_rng_state)
-        if self.get_rng_state_tracker is not None:
-            self.get_rng_state_tracker().set_states(rng_states[2])
+        rng_states.restore()
 
 
 class _recomputation_hook(
