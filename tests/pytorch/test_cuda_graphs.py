@@ -1613,3 +1613,86 @@ def test_make_graphed_callables_with_interleaved_pipeline_parallelism_reused_buf
     )
     assert_all_equal(outputs, graph_outputs)
     assert_all_equal(weights, graph_weights)
+
+
+@pytest.mark.parametrize("use_reentrant", [True, False])
+@pytest.mark.parametrize("tracker_streams", [None, 0, 1, 3])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("side_stream", [False, True])
+@pytest.mark.parametrize("module_count", [1, 2])
+def test_checkpoint_rng_graph_replay(
+    use_reentrant, tracker_streams, nested, side_stream, module_count, monkeypatch
+):
+    """Graph checkpoint replay must match eager gradients and RNG progression."""
+    import transformer_engine.pytorch.distributed as te_distributed
+
+    if not hasattr(torch.Generator, "philox_state"):
+        pytest.skip("Graph checkpoint snapshots require Generator.philox_state")
+    monkeypatch.setattr(te_distributed, "_ALL_ACTIVE_RNG_STATES", {})
+
+    def run(graphed):
+        torch.manual_seed(1234)
+        tracker = te_distributed.CudaRNGStatesTracker()
+        for index in range(tracker_streams or 0):
+            tracker.add(f"stream-{index}", 4321 + index)
+        states = tracker.get_states()
+        get_tracker = (lambda: tracker) if tracker_streams is not None else None
+
+        def checkpoint(function, value):
+            return te_distributed.checkpoint(
+                function, value, use_reentrant=use_reentrant, get_rng_state_tracker=get_tracker
+            )
+
+        def block(value):
+            value = torch.nn.functional.dropout(value, 0.5, True)
+            for name in states:
+                with tracker.fork(name):
+                    value = torch.nn.functional.dropout(value, 0.5, True)
+            return value
+
+        def outer(value):
+            return checkpoint(block, value) if nested else block(value)
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.ones(4096, device="cuda"))
+
+            def forward(self, value):
+                value = torch.nn.functional.dropout(value * self.weight, 0.5, True)
+                value = checkpoint(outer, value) if graphed else block(value)
+                return torch.nn.functional.dropout(value, 0.5, True)
+
+        models = tuple(Model() for _ in range(module_count))
+        if graphed:
+            samples = tuple((torch.ones(4096, device="cuda", requires_grad=True),) for _ in models)
+            models = make_graphed_callables(models, samples)
+        replay_stream = torch.cuda.Stream() if side_stream else torch.cuda.current_stream()
+        results = []
+        for _ in range(3):
+            for model in models:
+                model.weight.grad = None
+            inp = torch.ones(4096, device="cuda", requires_grad=True)
+            out = inp
+            for model in models:
+                if graphed:
+                    out = model(out, cuda_graph_stream=replay_stream)
+                else:
+                    out = model(out)
+            out.sum().backward()
+            torch.cuda.synchronize()
+            results.extend((out.detach().clone(), inp.grad.clone()))
+            results.extend(model.weight.grad.clone() for model in models)
+            results.append(torch.cuda.get_rng_state())
+            for name, state in tracker.get_states().items():
+                results.append(state.get_state())
+                torch.testing.assert_close(
+                    states[name].get_state(), state.get_state(), rtol=0, atol=0
+                )
+        return results
+
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        expected = run(False)
+        actual = run(True)
+    for result, reference in zip(actual, expected):
+        torch.testing.assert_close(result, reference, rtol=0, atol=0)

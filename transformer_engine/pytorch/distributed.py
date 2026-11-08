@@ -342,21 +342,41 @@ class _CheckpointRNGState:
         self.graph_safe = (
             is_graph_safe_rng_state(next(iter(self.tracker_states.values())))
             if self.tracker_states
-            else False
+            else torch.cuda.is_current_stream_capturing() and graph_safe_rng_available()
         )
         self.cuda_state = _get_cuda_rng_state(graph_safe=self.graph_safe)
         self.generator_snapshots = []
-        if self.graph_safe and not torch.cuda.is_current_stream_capturing():
+        self.capture_snapshots = []
+        if self.graph_safe:
             # Keep the original generators for CUDA graph registration, but save
             # independent values so eager RNG consumption cannot change the snapshot.
-            generators = [self.cuda_state, *self.tracker_states.values()]
+            generators = [self.cuda_state, *(self.tracker_states or {}).values()]
+            if torch.cuda.is_current_stream_capturing() and any(
+                not callable(getattr(generator, "philox_state", None)) for generator in generators
+            ):
+                raise RuntimeError(
+                    "CUDA graph checkpoint RNG snapshots require Generator.philox_state support"
+                )
             self.generator_snapshots = [
                 (generator, generator.get_state()) for generator in generators
             ]
+            if torch.cuda.is_current_stream_capturing():
+                # CPU state stores the capture-local offset. Save the replay-time
+                # seed/base offset on device as well, so separate forward/backward
+                # graphs use the same random numbers on each invocation.
+                for generator in generators:
+                    seed, offset, _ = generator.philox_state(0)
+                    self.capture_snapshots.append((generator, seed.clone(), offset.clone()))
 
     def restore(self):
         """Restore saved values without replacing graph-registered generator states."""
         torch.set_rng_state(self.cpu_state)
+        for generator, saved_seed, saved_offset in self.capture_snapshots:
+            # These aliases belong to the current capture, which can differ from
+            # the capture that produced the snapshot. Record copies into this graph.
+            seed, offset, _ = generator.philox_state(0)
+            seed.copy_(saved_seed)
+            offset.copy_(saved_offset)
         for generator, state in self.generator_snapshots:
             generator.set_state(state)
         _set_cuda_rng_state(self.cuda_state, graph_safe=self.graph_safe)
